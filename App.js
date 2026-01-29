@@ -16,7 +16,7 @@ import {
 } from 'react-native';
 import { BleManager } from 'react-native-ble-plx';
 
-const manager = new BleManager();
+const bleManager = new BleManager();
 const HEART_RATE_SERVICE_UUID = '0000180d-0000-1000-8000-00805f9b34fb';
 const HEART_RATE_MEASUREMENT_UUID = '00002a37-0000-1000-8000-00805f9b34fb';
 const HEART_RATE_MIN = 30;
@@ -32,16 +32,225 @@ export default function App() {
   const [isFullScreen, setIsFullScreen] = useState(false);
 
   const pulse = useRef(new Animated.Value(1)).current;
-  const colorProgress = useRef(new Animated.Value(0)).current;
   const connectedDeviceRef = useRef(null);
-  const monitorSubRef = useRef(null);
-  const disconnectSubRef = useRef(null);
   const scanTimeoutRef = useRef(null);
   const isScanningRef = useRef(false);
+  const charSubRef = useRef(null);
+  const deviceDisConnSubRef = useRef(null);
+
+  // 主流程
+  useEffect(() => {
+    // 开始扫描
+    startScan();
+
+    // 清理函数
+    return () => {
+      unsubConnectedDevice();
+      scanTimeoutRef.current = null;
+
+      (async () => {
+        await stopScan();
+        if (connectedDeviceRef.current) {
+          try {
+            if (bleManager.isDeviceConnected(connectedDeviceRef.current.id)) {
+              await bleManager.cancelDeviceConnection(connectedDeviceRef.current.id);
+            }
+          } catch (error) {
+            // 忽略清理时的错误
+            console.log('清理连接时出错:', error?.message);
+          }
+        }
+        bleManager.destroy();
+      })();
+    };
+  }, []);
+
+  // 开始扫描心率设备
+  const startScan = async () => {
+    unsubConnectedDevice();
+
+    if (isScanningRef.current) {
+      return;
+    }
+
+    // 1. 请求权限
+    const permissionGranted = await requestPermission();
+    if (!permissionGranted) {
+      setConnectionState('permission_denied');
+      Alert.alert('权限不足', '需要蓝牙与位置权限以扫描设备');
+      return;
+    }
+
+    // 2. 确保蓝牙已打开
+    try {
+      await ensureBluetoothOn();
+    } catch (error) {
+      setConnectionState('bluetooth_off');
+      Alert.alert('蓝牙不可用', '请开启蓝牙后重试');
+      return;
+    }
+
+    // 3. 开始扫描
+    setConnectionState('scanning');
+    setScanningState(true);
+    bleManager.startDeviceScan([HEART_RATE_SERVICE_UUID], null, (error, device) => {
+      if (error) {
+        (async () => {
+          await stopScan();
+        })();
+        setConnectionState('scan_error');
+        Alert.alert('扫描失败', error?.message ?? '扫描出现问题');
+        return;
+      }
+      if (device?.name || device?.localName) {
+        (async () => {
+          await stopScan();
+        })();
+        setConnectionState('connecting');
+        connectAndMonitor(device);
+      }
+    });
+
+    // 4. 注册扫描超时处理
+    scanTimeoutRef.current = setTimeout(async () => {
+      if (!isScanningRef.current) {
+        return;
+      }
+      await stopScan();
+      setConnectionState('no_device');
+    }, SCAN_TIMEOUT_MS);
+  };
 
   const setScanningState = (value) => {
     isScanningRef.current = value;
     setIsScanning(value);
+  };
+
+  // 停止扫描心率设备
+  const stopScan = async () => {
+    unsubConnectedDevice();
+    scanTimeoutRef.current = null;
+
+    // 确保扫描已停止
+    if (bleManager.isScanning) {
+      await bleManager.stopDeviceScan();
+    }
+    if (scanTimeoutRef.current) {
+      clearTimeout(scanTimeoutRef.current);
+      scanTimeoutRef.current = null;
+    }
+    setScanningState(false);
+  };
+
+  // 连接并读取心率设备
+  const connectAndMonitor = async (device) => {
+    try {
+      const connectedDevice = await device.connect();
+      connectedDeviceRef.current = connectedDevice;
+      setDeviceName(device.name || device.localName || '未知设备');
+      setConnectionState('connected');
+
+      await connectedDevice.discoverAllServicesAndCharacteristics();
+
+      // 监听断开连接事件
+      deviceDisConnSubRef.current?.remove();
+      deviceDisConnSubRef.current = bleManager.onDeviceDisconnected(device.id, handleDisconnection);
+
+      // 监听心率测量特征 (UUID: 0x2A37)
+      charSubRef.current?.remove();
+      charSubRef.current = connectedDevice.monitorCharacteristicForService(
+        HEART_RATE_SERVICE_UUID,
+        HEART_RATE_MEASUREMENT_UUID,
+        handleBleCharacteristic
+      );
+    } catch (error) {
+      setConnectionState('connect_error');
+      Alert.alert('连接失败', error?.message ?? '连接出现问题');
+      await startScan();
+    }
+  };
+
+  // 处理心率广播数据
+  const handleBleCharacteristic = (error, characteristic) => {
+    if (error) {
+      const msg = String(error?.message ?? '').toLowerCase();
+      if (
+        msg.includes('cancelled') ||
+        msg.includes('device disconnected') ||
+        msg.includes('gatt') ||
+        msg.includes('terminated')
+      ) {
+        return;
+      }
+      setConnectionState('monitor_error');
+      return;
+    }
+    if (!characteristic?.value) {
+      return;
+    }
+    const parsed = parseHeartRate(characteristic.value);
+    if (parsed === null) {
+      return;
+    }
+    setHeartRate(parsed);
+  }
+
+  // 被动断开连接
+  const handleDisconnection = (error, device) => {
+    if (error) {
+      console.log(`设备${device?.id || '未知'}断开连接错误:`, error);
+    }
+
+    unsubConnectedDevice();
+
+    (async () => {
+      if (bleManager.isDeviceConnected(device.id)) {
+        bleManager.cancelDeviceConnection(device.id);
+        return;
+      }
+      await stopScan();
+    })();
+
+    setConnectionState('disconnected');
+    setDeviceName(null);
+    setHeartRate(null);
+    // 暂时不触发重新扫描
+    // setTimeout(() => startScan(), 400);
+  };
+
+  // 重新扫描
+  const handleRescan = async () => {
+    await stopScan();
+    await handleDeviceDisconnect();
+    setDeviceName(null);
+    setHeartRate(null);
+    setTimeout(() => startScan(), 300);
+  };
+
+  // 主动断开连接
+  const handleDeviceDisconnect = async () => {
+    unsubConnectedDevice();
+    if (!connectedDeviceRef.current) {
+      return;
+    }
+
+    try {
+      if (bleManager.isDeviceConnected(connectedDeviceRef.current.id)) {
+        await bleManager.cancelDeviceConnection(connectedDeviceRef.current.id);
+      }
+    } catch (error) {
+      // 忽略已断开的设备
+      if (!error?.message?.includes('Device') && !error?.message?.includes('already')) {
+        Alert.alert('主动断开连接错误', error?.message ?? '主动断开连接出现问题');
+      }
+    }
+  };
+
+  const unsubConnectedDevice = () => {
+    charSubRef.current?.remove();
+    charSubRef.current = null;
+    deviceDisConnSubRef.current?.remove();
+    deviceDisConnSubRef.current = null;
   };
 
   const requestPermission = async () => {
@@ -74,7 +283,7 @@ export default function App() {
       const timeoutId = setTimeout(() => {
         reject(new Error('Bluetooth unavailable'));
       }, 7000);
-      const subscription = manager.onStateChange((state) => {
+      const subscription = bleManager.onStateChange((state) => {
         if (state === 'PoweredOn') {
           clearTimeout(timeoutId);
           subscription.remove();
@@ -102,109 +311,6 @@ export default function App() {
       return null;
     }
   };
-
-  const stopScan = () => {
-    manager.stopDeviceScan();
-    if (scanTimeoutRef.current) {
-      clearTimeout(scanTimeoutRef.current);
-      scanTimeoutRef.current = null;
-    }
-    setScanningState(false);
-  };
-
-  const connectAndMonitor = async (device) => {
-    try {
-      const connectedDevice = await device.connect();
-      connectedDeviceRef.current = connectedDevice;
-      await connectedDevice.discoverAllServicesAndCharacteristics();
-      setDeviceName(device.name || device.localName || '未知设备');
-      setConnectionState('connected');
-      disconnectSubRef.current?.remove();
-      disconnectSubRef.current = connectedDevice.onDisconnected(() => {
-        setConnectionState('disconnected');
-        setDeviceName(null);
-        setHeartRate(null);
-        startScan();
-      });
-      monitorSubRef.current?.remove();
-      monitorSubRef.current = connectedDevice.monitorCharacteristicForService(
-        HEART_RATE_SERVICE_UUID,
-        HEART_RATE_MEASUREMENT_UUID,
-        (error, characteristic) => {
-          if (error) {
-            setConnectionState('monitor_error');
-            return;
-          }
-          if (!characteristic?.value) {
-            return;
-          }
-          const parsed = parseHeartRate(characteristic.value);
-          if (parsed === null) {
-            return;
-          }
-          setHeartRate(parsed);
-        }
-      );
-    } catch (error) {
-      setConnectionState('connect_error');
-      Alert.alert('连接失败', error?.message ?? '连接出现问题');
-      startScan();
-    }
-  };
-
-  const startScan = async () => {
-    if (isScanningRef.current) {
-      return;
-    }
-    const permissionGranted = await requestPermission();
-    if (!permissionGranted) {
-      setConnectionState('permission_denied');
-      Alert.alert('权限不足', '需要蓝牙与位置权限以扫描设备');
-      return;
-    }
-    try {
-      await ensureBluetoothOn();
-    } catch (error) {
-      setConnectionState('bluetooth_off');
-      Alert.alert('蓝牙不可用', '请开启蓝牙后重试');
-      return;
-    }
-    setConnectionState('scanning');
-    setScanningState(true);
-    manager.startDeviceScan([HEART_RATE_SERVICE_UUID], null, (error, device) => {
-      if (error) {
-        stopScan();
-        setConnectionState('scan_error');
-        Alert.alert('扫描失败', error?.message ?? '扫描出现问题');
-        return;
-      }
-      if (device?.name || device?.localName) {
-        stopScan();
-        setConnectionState('connecting');
-        connectAndMonitor(device);
-      }
-    });
-    scanTimeoutRef.current = setTimeout(() => {
-      if (!isScanningRef.current) {
-        return;
-      }
-      stopScan();
-      setConnectionState('no_device');
-    }, SCAN_TIMEOUT_MS);
-  };
-
-  useEffect(() => {
-    startScan();
-    return () => {
-      stopScan();
-      monitorSubRef.current?.remove();
-      disconnectSubRef.current?.remove();
-      if (connectedDeviceRef.current) {
-        connectedDeviceRef.current.cancelConnection().catch(() => null);
-      }
-      manager.destroy();
-    };
-  }, []);
 
   useEffect(() => {
     if (isFullScreen) {
@@ -254,14 +360,6 @@ export default function App() {
     return 4;
   }, [heartRate]);
 
-  useEffect(() => {
-    Animated.timing(colorProgress, {
-      toValue: zoneIndex,
-      duration: 400,
-      useNativeDriver: false,
-    }).start();
-  }, [zoneIndex, colorProgress]);
-
   const statusText = useMemo(() => {
     switch (connectionState) {
       case 'scanning':
@@ -289,10 +387,7 @@ export default function App() {
     }
   }, [connectionState]);
 
-  const heartColor = colorProgress.interpolate({
-    inputRange: [0, 1, 2, 3, 4],
-    outputRange: HEART_ZONE_COLORS,
-  });
+  const heartColor = HEART_ZONE_COLORS[zoneIndex];
 
   if (isFullScreen) {
     return (
@@ -336,7 +431,7 @@ export default function App() {
         <Pressable style={styles.primaryButton} onPress={() => setIsFullScreen(true)}>
           <Text style={styles.primaryButtonText}>全屏</Text>
         </Pressable>
-        <Pressable style={styles.secondaryButton} onPress={startScan}>
+        <Pressable style={styles.secondaryButton} onPress={handleRescan}>
           <Text style={styles.secondaryButtonText}>重新扫描</Text>
         </Pressable>
       </View>
