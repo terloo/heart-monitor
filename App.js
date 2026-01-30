@@ -52,7 +52,7 @@ export default function App() {
         await stopScan();
         if (connectedDeviceRef.current) {
           try {
-            if (bleManager.isDeviceConnected(connectedDeviceRef.current.id)) {
+            if (await bleManager.isDeviceConnected(connectedDeviceRef.current.id)) {
               await bleManager.cancelDeviceConnection(connectedDeviceRef.current.id);
             }
           } catch (error) {
@@ -60,7 +60,7 @@ export default function App() {
             console.log('清理连接时出错:', error?.message);
           }
         }
-        bleManager.destroy();
+        await bleManager.destroy();
       })();
     };
   }, []);
@@ -132,9 +132,7 @@ export default function App() {
     scanTimeoutRef.current = null;
 
     // 确保扫描已停止
-    if (bleManager.isScanning) {
-      await bleManager.stopDeviceScan();
-    }
+    await bleManager.stopDeviceScan();
     if (scanTimeoutRef.current) {
       clearTimeout(scanTimeoutRef.current);
       scanTimeoutRef.current = null;
@@ -204,8 +202,8 @@ export default function App() {
     unsubConnectedDevice();
 
     (async () => {
-      if (bleManager.isDeviceConnected(device.id)) {
-        bleManager.cancelDeviceConnection(device.id);
+      if (await bleManager.isDeviceConnected(device.id)) {
+        await bleManager.cancelDeviceConnection(device.id);
         return;
       }
       await stopScan();
@@ -235,7 +233,7 @@ export default function App() {
     }
 
     try {
-      if (bleManager.isDeviceConnected(connectedDeviceRef.current.id)) {
+      if (await bleManager.isDeviceConnected(connectedDeviceRef.current.id)) {
         await bleManager.cancelDeviceConnection(connectedDeviceRef.current.id);
       }
     } catch (error) {
@@ -379,7 +377,7 @@ export default function App() {
       case 'connect_error':
         return '连接失败';
       case 'monitor_error':
-        return '监听中断';
+        return '连接中断';
       case 'disconnected':
         return '连接断开';
       default:
